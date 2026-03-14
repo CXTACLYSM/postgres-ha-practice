@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: postgres-ha-practice
+    folder: postgres-ha-practice
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

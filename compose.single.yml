@@ -66,6 +66,7 @@ services:
     volumes:
       # Datasource — Grafana автоматически подключится к Prometheus при старте
       - ./builds/local/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./builds/local/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
     depends_on:
       - prometheus
 

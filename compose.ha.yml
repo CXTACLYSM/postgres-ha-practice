@@ -1,0 +1,257 @@
+services:
+  # ===========================================================================
+  # APPLICATION
+  # ===========================================================================
+  target:
+    image: postgres-ha-practice:1.0
+    container_name: "target"
+    hostname: "target"
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+      - persistence
+    env_file:
+      - .envs/app/services/target/.env
+    depends_on:
+      postgres_primary:
+        condition: service_healthy
+      postgres_replica_1:
+        condition: service_healthy
+      postgres_replica_2:
+        condition: service_healthy
+
+  # ===========================================================================
+  # HAPROXY — READ LOAD BALANCER
+  # ===========================================================================
+  # ReadPool в приложении смотрит сюда: :5433
+  # HAProxy распределяет SELECT-запросы между replica_1 и replica_2
+  # round-robin: каждый следующий запрос идёт на следующую реплику
+  # health check: если реплика упала — HAProxy убирает её из ротации
+  # stats page: http://localhost:8404/stats — видно сколько запросов ушло на каждый бэкенд
+  haproxy:
+    image: haproxy:2.9-alpine
+    container_name: "haproxy"
+    hostname: "haproxy"
+    ports:
+      - "5433:5433"   # read endpoint — сюда смотрит ReadPool
+      - "8404:8404"   # stats UI
+    networks:
+      - persistence
+    volumes:
+      - ./builds/local/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      postgres_replica_1:
+        condition: service_healthy
+      postgres_replica_2:
+        condition: service_healthy
+
+  # ===========================================================================
+  # POSTGRESQL PRIMARY (WRITE)
+  # ===========================================================================
+  # Принимает все INSERT / UPDATE / DELETE от WritePool
+  # Стримит WAL на обе реплики через физическую репликацию
+  # Init-скрипт создаёт пользователей, права, и два replication slot
+  postgres_primary:
+    image: postgres:16-alpine
+    container_name: "postgres_primary"
+    hostname: "postgres_primary"
+    ports:
+      - "5432:5432"
+    networks:
+      - persistence
+    user: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: ha_practice
+      # Пользователи приложения — используются в init-скрипте
+      APP_WRITE_USER: app_write
+      APP_WRITE_PASSWORD: app_write_password
+      APP_READ_USER: app_read
+      APP_READ_PASSWORD: app_read_password
+      # Пользователь репликации — используется в init-скрипте и replica init
+      POSTGRES_REPLICATOR_USER: replicator
+      POSTGRES_REPLICATOR_PASSWORD: replicator_password
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./builds/local/postgres/primary/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./builds/local/postgres/primary/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts/init/postgres-primary-init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ha_practice"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # POSTGRESQL REPLICA 1 (READ)
+  # ===========================================================================
+  # Инициализируется из primary через pg_basebackup при первом старте
+  # Использует replication slot: replica_slot_1
+  # Всегда в режиме recovery — только SELECT, никаких записей
+  postgres_replica_1:
+    image: postgres:16-alpine
+    container_name: "postgres_replica_1"
+    hostname: "postgres_replica_1"
+    ports:
+      - "5434:5432"
+    networks:
+      - persistence
+    # root нужен чтобы init-скрипт мог сделать chown после pg_basebackup
+    # su-exec в конце скрипта переключает на postgres перед запуском PostgreSQL
+    user: root
+    environment:
+      PGUSER: app_read
+      PGDATABASE: ha_practice
+      # Параметры для replica init скрипта
+      PRIMARY_HOST: postgres_primary
+      REPLICATOR_USER: replicator
+      REPLICATOR_PASSWORD: replicator_password
+      # Имя слота — уникально для каждой реплики
+      # pg_basebackup -R -S ${REPLICA_SLOT_NAME} запишет его в postgresql.auto.conf
+      # auto.conf имеет приоритет над postgresql.conf поэтому конфликта нет
+      REPLICA_SLOT_NAME: replica_slot_1
+    volumes:
+      - postgres_replica_1_data:/var/lib/postgresql/data
+      - ./builds/local/postgres/replica/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./builds/local/postgres/replica/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts/init/postgres-replica-init.sh:/usr/local/bin/replica-init.sh:ro
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    command: ["/bin/bash", "/usr/local/bin/replica-init.sh"]
+    healthcheck:
+      # Два условия:
+      # 1. PostgreSQL принимает соединения
+      # 2. pg_is_in_recovery() = true — реплика подключена к primary и получает WAL
+      #    Если реплика поднялась как самостоятельный узел — этот check не пройдёт
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -d ha_practice -c 'SELECT pg_is_in_recovery()' | grep -q t"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      postgres_primary:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===========================================================================
+  # POSTGRESQL REPLICA 2 (READ)
+  # ===========================================================================
+  # Аналогична replica_1 — использует независимый replication slot: replica_slot_2
+  # Обе реплики получают WAL от primary независимо друг от друга
+  # HAProxy распределяет нагрузку между ними round-robin
+  postgres_replica_2:
+    image: postgres:16-alpine
+    container_name: "postgres_replica_2"
+    hostname: "postgres_replica_2"
+    ports:
+      - "5435:5432"
+    networks:
+      - persistence
+    user: root
+    environment:
+      PGUSER: app_read
+      PGDATABASE: ha_practice
+      PRIMARY_HOST: postgres_primary
+      REPLICATOR_USER: replicator
+      REPLICATOR_PASSWORD: replicator_password
+      # Единственное отличие от replica_1 — имя слота
+      REPLICA_SLOT_NAME: replica_slot_2
+    volumes:
+      - postgres_replica_2_data:/var/lib/postgresql/data
+      - ./builds/local/postgres/replica/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./builds/local/postgres/replica/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts/init/postgres-replica-init.sh:/usr/local/bin/replica-init.sh:ro
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    command: ["/bin/bash", "/usr/local/bin/replica-init.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -d ha_practice -c 'SELECT pg_is_in_recovery()' | grep -q t"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      postgres_primary:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===========================================================================
+  # MONITORING
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: "prometheus"
+    hostname: "prometheus"
+    ports:
+      - "9090:9090"
+    networks:
+      - backend
+    volumes:
+      - ./builds/local/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1d"
+    depends_on:
+      - target
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: "grafana"
+    hostname: "grafana"
+    ports:
+      - "3000:3000"
+    networks:
+      - backend
+    environment:
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+    volumes:
+      - ./builds/local/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./builds/local/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+
+networks:
+  backend:
+  persistence:
+
+volumes:
+  # down -v удалит все три volume — чистый старт для повторного эксперимента
+  postgres_primary_data:
+  postgres_replica_1_data:
+  postgres_replica_2_data:
