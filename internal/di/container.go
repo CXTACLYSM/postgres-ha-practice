@@ -107,7 +107,7 @@ func (c *Container) initMiddlewares() error {
 
 func (c *Container) initHandlers() error {
 	c.Handlers = &Handlers{
-		Target:  handlers.NewTargetHandler(c.Queries.Slow),
+		Target:  handlers.NewTargetHandler(c.Infrastructure.Logger, c.Queries.Slow),
 		Metrics: promhttp.Handler(),
 	}
 

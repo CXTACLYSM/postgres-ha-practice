@@ -6,15 +6,18 @@ import (
 	"time"
 
 	"github.com/CXTACLYSM/postgres-ha-practice/internal/queries/slow"
+	"go.uber.org/zap"
 )
 
 type TargetHandler struct {
-	Slow slow.Handler
+	logger *zap.Logger
+	slow   slow.Handler
 }
 
-func NewTargetHandler(slow slow.Handler) *TargetHandler {
+func NewTargetHandler(logger *zap.Logger, slow slow.Handler) *TargetHandler {
 	return &TargetHandler{
-		Slow: slow,
+		logger: logger.Named("target_handler"),
+		slow:   slow,
 	}
 }
 
@@ -22,8 +25,12 @@ func (h *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Millisecond)
 	defer cancel()
 
-	err := h.Slow.Handle(ctx, slow.Query{})
+	err := h.slow.Handle(ctx, slow.Query{})
 	if err != nil {
+		h.logger.Error("slow query failed",
+			zap.String("path", r.URL.Path),
+			zap.Error(err),
+		)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}

@@ -38,7 +38,7 @@ func NewMetrics() *Metrics {
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
 			Help:    "HTTP request duration in seconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: []float64{.005, .025, .075, .100, .125, .150, .175, .200, .250, .500, .750, 1, 1.25, 1.5, 1.75, 2, 2.5},
 		},
 		[]string{"status"},
 	)

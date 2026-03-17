@@ -46,7 +46,7 @@ func getPool(dsn string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("error parsing DSN: %w", err)
 	}
 
-	poolCfg.MaxConns = 25
+	poolCfg.MaxConns = 50
 	poolCfg.MinConns = 5
 	poolCfg.MaxConnLifetime = time.Hour
 	poolCfg.MaxConnIdleTime = 30 * time.Minute
